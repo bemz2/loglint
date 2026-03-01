@@ -6,32 +6,27 @@ import (
 	"go/types"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"golang.org/x/tools/go/analysis"
 )
 
 var Analyzer = &analysis.Analyzer{
 	Name: "loglint",
-	Doc:  "checks log messages",
+	Doc:  "checks slog and zap log messages against style rules",
 	Run:  run,
 }
 
 func run(pass *analysis.Pass) (any, error) {
 	for _, file := range pass.Files {
-
 		ast.Inspect(file, func(n ast.Node) bool {
-
 			call, ok := n.(*ast.CallExpr)
 			if !ok {
 				return true
 			}
 
 			fnName, pkgPath, ok := getCalledFunction(pass, call)
-			if !ok {
-				return true
-			}
-
-			if !isSupportedLogger(fnName, pkgPath) {
+			if !ok || !isSupportedLogger(fnName, pkgPath) {
 				return true
 			}
 
@@ -39,69 +34,59 @@ func run(pass *analysis.Pass) (any, error) {
 				return true
 			}
 
-			msgExpr := call.Args[0]
-
-			if containsSensitive(pass, msgExpr) {
-				pass.Reportf(msgExpr.Pos(), "log message may contain sensitive data")
+			// RULE 4 — Sensitive data (анализируем весь вызов)
+			if containsSensitiveCall(call) {
+				pass.Reportf(call.Pos(), "log message may contain sensitive data")
 			}
 
-			msg, ok := extractStringLiteral(msgExpr)
+			// RULE 1–3 — только если первый аргумент строка
+			msg, ok := extractStringLiteral(call.Args[0])
 			if !ok {
 				return true
 			}
 
 			if !startsWithLowercase(msg) {
-				pass.Reportf(msgExpr.Pos(), "log message must start with a lowercase letter")
+				pass.Reportf(call.Args[0].Pos(), "log message must start with a lowercase letter")
 			}
 
 			if !isEnglishOnly(msg) {
-				pass.Reportf(msgExpr.Pos(), "log message must be in English only")
+				pass.Reportf(call.Args[0].Pos(), "log message must be in English only")
 			}
 
 			if containsSpecialChars(msg) {
-				pass.Reportf(msgExpr.Pos(), "log message must not contain special symbols or emoji")
+				pass.Reportf(call.Args[0].Pos(), "log message must not contain special symbols or emoji")
 			}
 
 			return true
 		})
 	}
-
 	return nil, nil
 }
 
 func getCalledFunction(pass *analysis.Pass, call *ast.CallExpr) (string, string, bool) {
-
-	switch fun := call.Fun.(type) {
-
-	case *ast.SelectorExpr:
-		obj := pass.TypesInfo.Uses[fun.Sel]
+	if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+		obj := pass.TypesInfo.Uses[sel.Sel]
 		if obj == nil {
 			return "", "", false
 		}
-
 		fn, ok := obj.(*types.Func)
 		if !ok {
 			return "", "", false
 		}
-
-		pkg := fn.Pkg()
-		if pkg == nil {
+		if fn.Pkg() == nil {
 			return fn.Name(), "", true
 		}
-
-		return fn.Name(), pkg.Path(), true
+		return fn.Name(), fn.Pkg().Path(), true
 	}
-
 	return "", "", false
 }
 
 func isSupportedLogger(fnName, pkgPath string) bool {
-
 	if pkgPath == "log/slog" {
-		return fnName == "Debug" ||
-			fnName == "Info" ||
-			fnName == "Warn" ||
-			fnName == "Error"
+		switch fnName {
+		case "Debug", "Info", "Warn", "Error":
+			return true
+		}
 	}
 
 	if pkgPath == "go.uber.org/zap" {
@@ -121,12 +106,10 @@ func extractStringLiteral(expr ast.Expr) (string, bool) {
 	if !ok || lit.Kind != token.STRING {
 		return "", false
 	}
-
 	s, err := strconv.Unquote(lit.Value)
 	if err != nil {
 		return "", false
 	}
-
 	return s, true
 }
 
@@ -135,35 +118,35 @@ func startsWithLowercase(s string) bool {
 	if s == "" {
 		return true
 	}
+
 	r := []rune(s)[0]
+
+	if !unicode.IsLetter(r) {
+		return true
+	}
+
 	return r >= 'a' && r <= 'z'
 }
 
 func isEnglishOnly(s string) bool {
 	for _, r := range s {
-		if r >= 'a' && r <= 'z' {
-			continue
+		if unicode.IsLetter(r) {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+				return false
+			}
 		}
-		if r >= 'A' && r <= 'Z' {
-			continue
-		}
-		if r >= '0' && r <= '9' {
-			continue
-		}
-		if r == ' ' {
-			continue
-		}
-		return false
 	}
 	return true
 }
 
 func containsSpecialChars(s string) bool {
 	for _, r := range s {
-		if (r >= 'a' && r <= 'z') ||
-			(r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') ||
-			r == ' ' {
+		if unicode.IsLetter(r) ||
+			unicode.IsDigit(r) ||
+			r == ' ' ||
+			r == '_' ||
+			r == '-' ||
+			r == '%' {
 			continue
 		}
 		return true
@@ -171,45 +154,48 @@ func containsSpecialChars(s string) bool {
 	return false
 }
 
-var sensitiveKeywords = []string{
+var sensitiveIdentifiers = []string{
 	"password",
-	"token",
-	"api_key",
+	"passwd",
+	"pwd",
 	"apikey",
 	"secret",
+	"token",
 }
 
-func containsSensitive(pass *analysis.Pass, expr ast.Expr) bool {
+func containsSensitiveCall(call *ast.CallExpr) bool {
+	for _, arg := range call.Args {
+		found := false
+		ast.Inspect(arg, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok {
+				name := strings.ToLower(id.Name)
+				for _, k := range sensitiveIdentifiers {
+					if strings.Contains(name, k) {
+						found = true
+						return false
+					}
+				}
+			}
+			return true
+		})
+		if found {
+			return true
+		}
+	}
 
-	if s, ok := extractStringLiteral(expr); ok {
-		low := strings.ToLower(s)
-		for _, k := range sensitiveKeywords {
-			if strings.Contains(low, k) {
+	// structured logging key-value pairs
+	for i := 1; i+1 < len(call.Args); i += 2 {
+		key, ok := extractStringLiteral(call.Args[i])
+		if !ok {
+			continue
+		}
+		key = strings.ToLower(key)
+		for _, k := range sensitiveIdentifiers {
+			if key == k {
 				return true
 			}
 		}
 	}
 
-	found := false
-
-	ast.Inspect(expr, func(n ast.Node) bool {
-		id, ok := n.(*ast.Ident)
-		if !ok {
-			return true
-		}
-
-		name := strings.ToLower(id.Name)
-
-		for _, k := range sensitiveKeywords {
-			k = strings.ReplaceAll(k, "_", "")
-			if strings.Contains(name, k) {
-				found = true
-				return false
-			}
-		}
-
-		return true
-	})
-
-	return found
+	return false
 }
