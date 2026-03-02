@@ -60,7 +60,7 @@ func run(pass *analysis.Pass, analyzer *analysis.Analyzer, override *Config) (an
 			}
 
 			if cfg.CheckLowercaseStart && !startsWithLowercase(msg) {
-				pass.Reportf(call.Args[0].Pos(), "log message must start with a lowercase letter")
+				pass.Report(lowercaseDiagnostic(call.Args[0], msg))
 			}
 
 			if cfg.CheckEnglishOnly && !isEnglishOnly(msg) {
@@ -75,6 +75,34 @@ func run(pass *analysis.Pass, analyzer *analysis.Analyzer, override *Config) (an
 		})
 	}
 	return nil, nil
+}
+
+func lowercaseDiagnostic(expr ast.Expr, msg string) analysis.Diagnostic {
+	diag := analysis.Diagnostic{
+		Pos:     expr.Pos(),
+		End:     expr.End(),
+		Message: "log message must start with a lowercase letter",
+	}
+
+	fixed, ok := lowerFirstASCIILetter(msg)
+	if !ok {
+		return diag
+	}
+
+	diag.SuggestedFixes = []analysis.SuggestedFix{
+		{
+			Message: "Make first letter lowercase",
+			TextEdits: []analysis.TextEdit{
+				{
+					Pos:     expr.Pos(),
+					End:     expr.End(),
+					NewText: []byte(strconv.Quote(fixed)),
+				},
+			},
+		},
+	}
+
+	return diag
 }
 
 func resolveConfig(analyzer *analysis.Analyzer, override *Config) (effectiveConfig, error) {
@@ -167,6 +195,22 @@ func startsWithLowercase(s string) bool {
 	}
 
 	return true
+}
+
+func lowerFirstASCIILetter(s string) (string, bool) {
+	trimmedPrefixLen := len(s) - len(strings.TrimLeftFunc(s, unicode.IsSpace))
+	trimmed := s[trimmedPrefixLen:]
+	if trimmed == "" {
+		return "", false
+	}
+
+	runes := []rune(trimmed)
+	if runes[0] < 'A' || runes[0] > 'Z' {
+		return "", false
+	}
+
+	runes[0] += 'a' - 'A'
+	return s[:trimmedPrefixLen] + string(runes), true
 }
 
 func isEnglishOnly(s string) bool {
