@@ -1,6 +1,7 @@
 package loglint
 
 import (
+	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
@@ -11,13 +12,28 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
-var Analyzer = &analysis.Analyzer{
-	Name: "loglint",
-	Doc:  "checks slog and zap log messages against style rules",
-	Run:  run,
+var Analyzer = NewAnalyzer(nil)
+
+func NewAnalyzer(override *Config) *analysis.Analyzer {
+	analyzer := &analysis.Analyzer{
+		Name: "loglint",
+		Doc:  "checks slog and zap log messages against style rules",
+	}
+
+	analyzer.Flags.String("config", "", "path to a loglint JSON config file")
+	analyzer.Run = func(pass *analysis.Pass) (any, error) {
+		return run(pass, analyzer, override)
+	}
+
+	return analyzer
 }
 
-func run(pass *analysis.Pass) (any, error) {
+func run(pass *analysis.Pass, analyzer *analysis.Analyzer, override *Config) (any, error) {
+	cfg, err := resolveConfig(analyzer, override)
+	if err != nil {
+		return nil, err
+	}
+
 	for _, file := range pass.Files {
 		ast.Inspect(file, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
@@ -34,26 +50,24 @@ func run(pass *analysis.Pass) (any, error) {
 				return true
 			}
 
-			// RULE 4 — Sensitive data (анализируем весь вызов)
-			if containsSensitiveCall(call) {
+			if cfg.CheckSensitiveData && containsSensitiveCall(call, cfg.SensitiveKeywords) {
 				pass.Reportf(call.Pos(), "log message may contain sensitive data")
 			}
 
-			// RULE 1–3 — только если первый аргумент строка
 			msg, ok := extractStringLiteral(call.Args[0])
 			if !ok {
 				return true
 			}
 
-			if !startsWithLowercase(msg) {
+			if cfg.CheckLowercaseStart && !startsWithLowercase(msg) {
 				pass.Reportf(call.Args[0].Pos(), "log message must start with a lowercase letter")
 			}
 
-			if !isEnglishOnly(msg) {
+			if cfg.CheckEnglishOnly && !isEnglishOnly(msg) {
 				pass.Reportf(call.Args[0].Pos(), "log message must be in English only")
 			}
 
-			if containsSpecialChars(msg) {
+			if cfg.CheckSpecialChars && containsSpecialChars(msg) {
 				pass.Reportf(call.Args[0].Pos(), "log message must not contain special symbols or emoji")
 			}
 
@@ -61,6 +75,25 @@ func run(pass *analysis.Pass) (any, error) {
 		})
 	}
 	return nil, nil
+}
+
+func resolveConfig(analyzer *analysis.Analyzer, override *Config) (effectiveConfig, error) {
+	cfg := defaultConfig()
+	if analyzer == nil {
+		return mergeConfig(cfg, override), nil
+	}
+
+	pathFlag := analyzer.Flags.Lookup("config")
+	if pathFlag == nil || pathFlag.Value.String() == "" {
+		return mergeConfig(cfg, override), nil
+	}
+
+	fileConfig, err := loadConfigFile(pathFlag.Value.String())
+	if err != nil {
+		return effectiveConfig{}, fmt.Errorf("load loglint config: %w", err)
+	}
+
+	return mergeConfig(cfg, fileConfig, override), nil
 }
 
 func getCalledFunction(pass *analysis.Pass, call *ast.CallExpr) (string, string, bool) {
@@ -125,7 +158,15 @@ func startsWithLowercase(s string) bool {
 		return true
 	}
 
-	return r >= 'a' && r <= 'z'
+	if r >= 'a' && r <= 'z' {
+		return true
+	}
+
+	if r >= 'A' && r <= 'Z' {
+		return false
+	}
+
+	return true
 }
 
 func isEnglishOnly(s string) bool {
@@ -154,22 +195,13 @@ func containsSpecialChars(s string) bool {
 	return false
 }
 
-var sensitiveIdentifiers = []string{
-	"password",
-	"passwd",
-	"pwd",
-	"apikey",
-	"secret",
-	"token",
-}
-
-func containsSensitiveCall(call *ast.CallExpr) bool {
+func containsSensitiveCall(call *ast.CallExpr, sensitiveKeywords []string) bool {
 	for _, arg := range call.Args {
 		found := false
 		ast.Inspect(arg, func(n ast.Node) bool {
 			if id, ok := n.(*ast.Ident); ok {
 				name := strings.ToLower(id.Name)
-				for _, k := range sensitiveIdentifiers {
+				for _, k := range sensitiveKeywords {
 					if strings.Contains(name, k) {
 						found = true
 						return false
@@ -190,7 +222,7 @@ func containsSensitiveCall(call *ast.CallExpr) bool {
 			continue
 		}
 		key = strings.ToLower(key)
-		for _, k := range sensitiveIdentifiers {
+		for _, k := range sensitiveKeywords {
 			if key == k {
 				return true
 			}
