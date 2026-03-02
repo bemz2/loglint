@@ -7,8 +7,13 @@ import (
 )
 
 // New is the golangci-lint Go plugin entrypoint.
-func New(_ any) ([]*analysis.Analyzer, error) {
-	return []*analysis.Analyzer{loglint.Analyzer}, nil
+func New(conf any) ([]*analysis.Analyzer, error) {
+	cfg, err := loglint.ConfigFromAny(conf)
+	if err != nil {
+		return nil, err
+	}
+
+	return []*analysis.Analyzer{loglint.NewAnalyzer(cfg)}, nil
 }
 
 func main() {}
